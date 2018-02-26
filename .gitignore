@@ -1,3 +1,2 @@
-/proto/protoc-gen-go.exe
-/proto/protoc.exe
-/protoc-gen-msg/protoc-gen-msg.exe
+*.exe
+/.idea

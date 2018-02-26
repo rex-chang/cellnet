@@ -1,41 +1,49 @@
 package cellnet
 
+// 会话
+type Session interface {
+
+	// 发包
+	Send(interface{})
+
+	// 直接发送封包
+	RawSend(*Event)
+
+	// 断开
+	Close()
+
+	// 标示ID
+	ID() int64
+
+	// 归属端
+	FromPeer() Peer
+
+	// 将一个用户数据保存在session
+	SetTag(tag interface{})
+
+	// 取出与session关联的用户数据
+	Tag() interface{}
+
+	// 取原始连接net.Conn
+	RawConn() interface{}
+}
+
+// 端, Connector或Acceptor
 type Peer interface {
 
-	// 开启
+	// 开启/关闭
 	Start(address string) Peer
 
-	// 关闭
 	Stop()
 
-	// 名字
-	SetName(string)
-	Name() string
+	Queue() EventQueue
 
-	// 事件
-	EventQueue
+	// 基础信息
+	PeerProfile
 
-	// 连接管理
-	SessionManager
-}
+	// 定制处理链
+	HandlerChainManager
 
-type Connector interface {
-
-	// 连接后的Session
-	DefaultSession() Session
-
-	// 自动重连间隔, 0表示不重连, 默认不重连
-	SetAutoReconnectSec(sec int)
-}
-
-type SessionManager interface {
-
-	// 获取一个连接
-	GetSession(int64) Session
-
-	// 遍历连接
-	IterateSession(func(Session) bool)
-
-	// 连接数量
-	SessionCount() int
+	// 会话管理
+	SessionAccessor
 }

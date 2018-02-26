@@ -4,18 +4,24 @@ import (
 	"net"
 
 	"github.com/davyxu/cellnet"
+	"github.com/davyxu/cellnet/extend"
 )
 
 type socketAcceptor struct {
-	*peerProfile
-	*sessionMgr
+	*socketPeer
 
 	listener net.Listener
-
-	running bool
 }
 
 func (self *socketAcceptor) Start(address string) cellnet.Peer {
+
+	self.waitStopFinished()
+
+	if self.IsRunning() {
+		return self
+	}
+
+	self.SetAddress(address)
 
 	ln, err := net.Listen("tcp", address)
 
@@ -23,69 +29,96 @@ func (self *socketAcceptor) Start(address string) cellnet.Peer {
 
 	if err != nil {
 
-		log.Errorf("#listen failed(%s) %v", self.name, err.Error())
+		log.Errorf("#listen failed(%s) %v", self.NameOrAddress(), err.Error())
 		return self
 	}
 
-	self.running = true
-
-	log.Debugf("#listen(%s) %s ", self.name, address)
+	log.Infof("#listen(%s) %s", self.Name(), self.Address())
 
 	// 接受线程
-	go func() {
-		for self.running {
-			conn, err := ln.Accept()
-
-			if err != nil {
-				log.Errorln(err)
-				break
-			}
-
-			ses := newSession(NewPacketStream(conn), self.EventQueue, self)
-
-			// 添加到管理器
-			self.sessionMgr.Add(ses)
-
-			// 断开后从管理器移除
-			ses.OnClose = func() {
-				self.sessionMgr.Remove(ses)
-			}
-
-			log.Debugf("#accepted(%s) sid: %d", self.name, ses.ID())
-
-			// 通知逻辑
-			self.PostData(NewSessionEvent(Event_SessionAccepted, ses, nil))
-
-		}
-
-	}()
-
-	self.PostData(NewPeerEvent(Event_PeerStart, self))
+	go self.accept()
 
 	return self
 }
 
+func (self *socketAcceptor) accept() {
+
+	self.SetRunning(true)
+
+	for {
+		conn, err := self.listener.Accept()
+
+		if self.isStopping() {
+			break
+		}
+
+		if err != nil {
+
+			// 调试状态时, 才打出accept的具体错误
+			if log.IsDebugEnabled() {
+				log.Errorf("#accept failed(%s) %v", self.NameOrAddress(), err.Error())
+			}
+
+			extend.PostSystemEvent(nil, cellnet.Event_AcceptFailed, self.ChainListRecv(), errToResult(err))
+
+			break
+		}
+
+		// 处理连接进入独立线程, 防止accept无法响应
+		go self.onAccepted(conn)
+
+	}
+
+	self.SetRunning(false)
+
+	self.endStopping()
+}
+
+func (self *socketAcceptor) onAccepted(conn net.Conn) {
+
+	ses := newSession(conn, self)
+
+	// 添加到管理器
+	self.Add(ses)
+
+	// 断开后从管理器移除
+	ses.OnClose = func() {
+		self.Remove(ses)
+	}
+
+	// 投递连接已接受事件
+	extend.PostSystemEvent(ses, cellnet.Event_Accepted, self.ChainListRecv(), cellnet.Result_OK)
+
+	// 事件处理完成开始处理数据收发
+	ses.run()
+}
+
 func (self *socketAcceptor) Stop() {
 
-	if !self.running {
+	if !self.IsRunning() {
 		return
 	}
 
-	self.PostData(NewPeerEvent(Event_PeerStop, self))
-
-	self.running = false
-
-	self.listener.Close()
-}
-
-func NewAcceptor(pipe cellnet.EventPipe) cellnet.Peer {
-
-	self := &socketAcceptor{
-		sessionMgr:  newSessionManager(),
-		peerProfile: newPeerProfile(pipe.AddQueue()),
+	if self.isStopping() {
+		return
 	}
 
-	self.PostData(NewPeerEvent(Event_PeerInit, self))
+	self.startStopping()
+
+	self.listener.Close()
+
+	// 断开所有连接
+	self.CloseAllSession()
+
+	// 等待线程结束
+	self.waitStopFinished()
+}
+
+func NewAcceptor(q cellnet.EventQueue) cellnet.Peer {
+
+	self := &socketAcceptor{
+		socketPeer: newSocketPeer(q, cellnet.NewSessionManager()),
+	}
 
 	return self
 }

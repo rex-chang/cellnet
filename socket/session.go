@@ -1,19 +1,15 @@
 package socket
 
 import (
-	"sync"
-
 	"github.com/davyxu/cellnet"
-	"github.com/golang/protobuf/proto"
+	"github.com/davyxu/cellnet/extend"
+	"io"
+	"net"
+	"sync"
+	"time"
 )
 
-type closeWritePacket struct {
-}
-
-type ltvSession struct {
-	writeChan chan interface{}
-	stream    PacketStream
-
+type socketSession struct {
 	OnClose func() // 关闭函数回调
 
 	id int64
@@ -23,66 +19,168 @@ type ltvSession struct {
 	endSync sync.WaitGroup
 
 	needNotifyWrite bool // 是否需要通知写线程关闭
+
+	sendList *eventList
+
+	conn net.Conn
+
+	tag interface{}
+
+	tagGuard sync.RWMutex
+
+	readChain *cellnet.HandlerChain
+
+	writeChain *cellnet.HandlerChain
 }
 
-func (self *ltvSession) ID() int64 {
+func (self *socketSession) RawConn() interface{} {
+	return self.conn
+}
+
+func (self *socketSession) Tag() interface{} {
+	self.tagGuard.RLock()
+	defer self.tagGuard.RUnlock()
+	return self.tag
+}
+func (self *socketSession) SetTag(tag interface{}) {
+	self.tagGuard.Lock()
+	self.tag = tag
+	self.tagGuard.Unlock()
+}
+
+func (self *socketSession) ID() int64 {
 	return self.id
 }
 
-func (self *ltvSession) FromPeer() cellnet.Peer {
+func (self *socketSession) SetID(id int64) {
+	self.id = id
+}
+
+func (self *socketSession) FromPeer() cellnet.Peer {
 	return self.p
 }
 
-func (self *ltvSession) Close() {
+func (self *socketSession) DataSource() io.ReadWriter {
 
-	self.writeChan <- closeWritePacket{}
+	return self.conn
 }
 
-func (self *ltvSession) Send(data interface{}) {
+func (self *socketSession) Close() {
+	self.sendList.Add(nil)
+}
 
-	pkt, meta := cellnet.BuildPacket(data)
+func (self *socketSession) Send(data interface{}) {
 
-	if EnableMessageLog {
-		msgLog(&MessageLogInfo{
-			Dir:       "send",
-			PeerName:  self.FromPeer().Name(),
-			SessionID: self.ID(),
-			Name:      meta.Name,
-			ID:        meta.ID,
-			Size:      int32(len(pkt.Data)),
-			Data:      data.(proto.Message).String(),
-		})
+	ev := cellnet.NewEvent(cellnet.Event_Send, self)
+	ev.Msg = data
 
+	if ev.ChainSend == nil {
+		ev.ChainSend = self.p.ChainSend()
 	}
 
-	self.RawSend(pkt)
+	self.RawSend(ev)
+
 }
 
-func (self *ltvSession) RawSend(pkt *cellnet.Packet) {
+func (self *socketSession) RawSend(ev *cellnet.Event) {
 
-	if pkt == nil {
-		return
+	if ev.Type != cellnet.Event_Send {
+		panic("invalid event type, require Event_Send")
 	}
 
-	self.writeChan <- pkt
+	ev.Ses = self
+
+	self.sendList.Add(ev)
 }
 
-// 发送线程
-func (self *ltvSession) sendThread() {
+func (self *socketSession) recvThread() {
 
 	for {
 
-		switch pkt := (<-self.writeChan).(type) {
-		// 关闭循环
-		case closeWritePacket:
-			goto exitsendloop
-		// 封包
-		case *cellnet.Packet:
-			if err := self.stream.Write(pkt); err != nil {
-				goto exitsendloop
-			}
+		ev := cellnet.NewEvent(cellnet.Event_Recv, self)
+
+		read, _ := self.FromPeer().(SocketOptions).SocketDeadline()
+
+		if read != 0 {
+			self.conn.SetReadDeadline(time.Now().Add(read))
 		}
 
+		self.readChain.Call(ev)
+
+		if ev.Result() != cellnet.Result_OK {
+			goto onClose
+		}
+
+		// 接收日志
+		cellnet.MsgLog(ev)
+
+		self.p.ChainListRecv().Call(ev)
+
+		if ev.Result() != cellnet.Result_OK {
+			goto onClose
+		}
+
+		continue
+
+	onClose:
+		extend.PostSystemEvent(ev.Ses, cellnet.Event_Closed, self.p.ChainListRecv(), ev.Result())
+		break
+	}
+
+	if self.needNotifyWrite {
+		self.Close()
+	}
+
+	// 通知接收线程ok
+	self.endSync.Done()
+
+}
+
+// 发送线程
+func (self *socketSession) sendThread() {
+
+	for {
+
+		// 写超时
+		_, write := self.FromPeer().(SocketOptions).SocketDeadline()
+
+		if write != 0 {
+			self.conn.SetWriteDeadline(time.Now().Add(write))
+		}
+
+		writeList, willExit := self.sendList.Pick()
+
+		// 写队列
+		for _, ev := range writeList {
+
+			// 发送链处理: encode等操作
+			if ev.ChainSend != nil {
+				ev.ChainSend.Call(ev)
+			}
+
+			if ev.Result() != cellnet.Result_OK {
+				willExit = true
+			}
+
+			// 发送日志
+			cellnet.MsgLog(ev)
+
+			// 写链处理
+			self.writeChain.Call(ev)
+
+			if ev.Result() != cellnet.Result_OK {
+				willExit = true
+			}
+
+		}
+
+		//if err := self.conn.Flush(); err != nil {
+		//	willExit = true
+		//}
+
+		if willExit {
+			goto exitsendloop
+		}
 	}
 
 exitsendloop:
@@ -91,80 +189,51 @@ exitsendloop:
 	self.needNotifyWrite = false
 
 	// 关闭socket,触发读错误, 结束读循环
-	self.stream.Close()
+	self.conn.Close()
 
 	// 通知发送线程ok
 	self.endSync.Done()
 }
 
-// 接收线程
-func (self *ltvSession) recvThread(eq cellnet.EventQueue) {
-	var err error
-	var pkt *cellnet.Packet
-
-	for {
-
-		// 从Socket读取封包
-		pkt, err = self.stream.Read()
-
-		if err != nil {
-
-			// 断开事件
-			eq.PostData(NewSessionEvent(Event_SessionClosed, self, nil))
-			break
-		}
-
-		// 逻辑封包
-		eq.PostData(&SessionEvent{
-			Packet: pkt,
-			Ses:    self,
-		})
-
-	}
-
-	if self.needNotifyWrite {
-
-		// 通知发送线程停止
-		self.writeChan <- closeWritePacket{}
-	}
-
-	// 通知接收线程ok
-	self.endSync.Done()
-}
-
-// 退出线程
-func (self *ltvSession) exitThread() {
-
+func (self *socketSession) run() {
 	// 布置接收和发送2个任务
+	// bug fix感谢viwii提供的线索
 	self.endSync.Add(2)
 
-	// 等待2个任务结束
-	self.endSync.Wait()
+	go func() {
 
-	// 在这里断开session与逻辑的所有关系
-	if self.OnClose != nil {
-		self.OnClose()
-	}
+		// 等待2个任务结束
+		self.endSync.Wait()
 
-}
-
-func newSession(stream PacketStream, eq cellnet.EventQueue, p cellnet.Peer) *ltvSession {
-
-	self := &ltvSession{
-		writeChan:       make(chan interface{}),
-		stream:          stream,
-		p:               p,
-		needNotifyWrite: true,
-	}
-
-	// 退出线程
-	go self.exitThread()
+		// 在这里断开session与逻辑的所有关系
+		if self.OnClose != nil {
+			self.OnClose()
+		}
+	}()
 
 	// 接收线程
-	go self.recvThread(eq)
+	go self.recvThread()
 
 	// 发送线程
 	go self.sendThread()
+}
+
+func newSession(conn net.Conn, p cellnet.Peer) *socketSession {
+
+	p.(interface {
+		Apply(conn net.Conn)
+	}).Apply(conn)
+
+	self := &socketSession{
+		conn:            conn,
+		p:               p,
+		needNotifyWrite: true,
+		sendList:        NewPacketList(),
+	}
+
+	self.readChain = p.CreateChainRead()
+
+	self.writeChain = p.CreateChainWrite()
 
 	return self
 }

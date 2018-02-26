@@ -5,19 +5,27 @@ import (
 	"time"
 
 	"github.com/davyxu/cellnet"
+	"github.com/davyxu/cellnet/extend"
 )
 
-type socketConnector struct {
-	*peerProfile
-	*sessionMgr
+// 连接器, 可由Peer转换
+type Connector interface {
 
-	conn net.Conn
+	// 连接后的Session
+	DefaultSession() cellnet.Session
+
+	// 自动重连间隔, 0表示不重连, 默认不重连
+	SetAutoReconnectSec(sec int)
+}
+
+type socketConnector struct {
+	*socketPeer
 
 	autoReconnectSec int // 重连间隔时间, 0为不重连
 
-	closeSignal chan bool
+	tryConnTimes int // 尝试连接次数
 
-	working bool // 重入锁
+	closeSignal chan bool
 
 	defaultSes cellnet.Session
 }
@@ -29,32 +37,46 @@ func (self *socketConnector) SetAutoReconnectSec(sec int) {
 
 func (self *socketConnector) Start(address string) cellnet.Peer {
 
-	if self.working {
+	self.waitStopFinished()
+
+	if self.IsRunning() {
 		return self
 	}
 
 	go self.connect(address)
 
-	self.PostData(NewPeerEvent(Event_PeerStart, self))
-
 	return self
 }
 
+const reportConnectFailedLimitTimes = 3
+
 func (self *socketConnector) connect(address string) {
-	self.working = true
+
+	self.SetRunning(true)
+	self.SetAddress(address)
 
 	for {
 
+		self.tryConnTimes++
+
 		// 开始连接
-		cn, err := net.Dial("tcp", address)
+		conn, err := net.Dial("tcp", address)
 
 		// 连不上
 		if err != nil {
 
-			log.Errorf("#connect failed(%s) %v", self.name, err.Error())
+			if self.tryConnTimes <= reportConnectFailedLimitTimes {
+				log.Errorf("#connect failed(%s) %v", self.NameOrAddress(), err.Error())
+			}
+
+			if self.tryConnTimes == reportConnectFailedLimitTimes {
+				log.Errorf("(%s) continue reconnecting, but mute log", self.NameOrAddress())
+			}
 
 			// 没重连就退出
 			if self.autoReconnectSec == 0 {
+
+				extend.PostSystemEvent(nil, cellnet.Event_ConnectFailed, self.ChainListRecv(), errToResult(err))
 				break
 			}
 
@@ -65,31 +87,31 @@ func (self *socketConnector) connect(address string) {
 			continue
 		}
 
-		// 连上了, 记录连接
-		self.conn = cn
-
 		// 创建Session
-		ses := newSession(NewPacketStream(cn), self.EventQueue, self)
-		self.sessionMgr.Add(ses)
-		self.defaultSes = ses
+		ses := newSession(conn, self)
 
-		log.Debugf("#connected(%s) %s sid: %d", self.name, address, ses.id)
+		self.defaultSes = ses
+		self.tryConnTimes = 0
+		self.Add(ses)
 
 		// 内部断开回调
 		ses.OnClose = func() {
-			self.sessionMgr.Remove(ses)
+			self.Remove(ses)
 			self.closeSignal <- true
 		}
 
-		// 抛出事件
-		self.PostData(NewSessionEvent(Event_SessionConnected, ses, nil))
+		// 投递连接建立事件
+		extend.PostSystemEvent(ses, cellnet.Event_Connected, self.ChainListRecv(), cellnet.Result_OK)
+
+		// 事件处理完成开始处理数据收发
+		ses.run()
 
 		if <-self.closeSignal {
 
-			self.conn = nil
+			self.defaultSes = nil
 
-			// 没重连就退出
-			if self.autoReconnectSec == 0 {
+			// 没重连就退出/主动退出
+			if self.isStopping() || self.autoReconnectSec == 0 {
 				break
 			}
 
@@ -103,32 +125,49 @@ func (self *socketConnector) connect(address string) {
 
 	}
 
-	self.working = false
+	self.SetRunning(false)
+
+	self.endStopping()
 }
 
 func (self *socketConnector) Stop() {
 
-	if self.conn != nil {
-
-		self.PostData(NewPeerEvent(Event_PeerStop, self))
-
-		self.conn.Close()
+	if !self.IsRunning() {
+		return
 	}
 
+	if self.isStopping() {
+		return
+	}
+
+	self.startStopping()
+
+	if self.defaultSes != nil {
+		self.defaultSes.Close()
+	}
+
+	// 等待线程结束
+	self.waitStopFinished()
 }
 
 func (self *socketConnector) DefaultSession() cellnet.Session {
 	return self.defaultSes
 }
 
-func NewConnector(pipe cellnet.EventPipe) cellnet.Peer {
+func (self *socketConnector) RPCSession() cellnet.Session {
+	return self.defaultSes
+}
+
+func NewConnector(q cellnet.EventQueue) cellnet.Peer {
+
+	return NewConnectorBySessionManager(q, cellnet.NewSessionManager())
+}
+
+func NewConnectorBySessionManager(q cellnet.EventQueue, sm cellnet.SessionManager) cellnet.Peer {
 	self := &socketConnector{
-		sessionMgr:  newSessionManager(),
-		peerProfile: newPeerProfile(pipe.AddQueue()),
+		socketPeer:  newSocketPeer(q, sm),
 		closeSignal: make(chan bool),
 	}
-
-	self.PostData(NewPeerEvent(Event_PeerInit, self))
 
 	return self
 }
